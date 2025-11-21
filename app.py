@@ -1,161 +1,92 @@
-class ChartBlock(BaseModel):
-    type: Literal["chart"] = "chart"
-    chart_type: Literal["line", "bar", "scatter", "pie", "histogram", "box", "heatmap", "3d_scatter", "plotly_json"]
-    data: Dict[str, Any]  # Flexible data structure
-    title: str | None = None
-    x_label: str | None = None
-    y_label: str | None = None
-    plotly_config: Dict[str, Any] | None = None  # For raw Plotly figure JSON
+import operator
+from typing import Annotated, List, Literal, Union
+from pydantic import BaseModel, Field
 
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import BaseMessage
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+from langgraph.checkpoint.memory import MemorySaver
+
+# --- 1. DEFINE STRUCTURED OUTPUT (Link 1) ---
 class TextBlock(BaseModel):
     type: Literal["text"] = "text"
     content: str
-
-class FormulaBlock(BaseModel):
-    type: Literal["formula"] = "formula"
-    content: str
-    display_mode: bool = True
 
 class TableBlock(BaseModel):
     type: Literal["table"] = "table"
     headers: List[str]
     rows: List[List[str]]
-    caption: str | None = None
 
-class CodeBlock(BaseModel):
-    type: Literal["code"] = "code"
-    content: str
-    language: str = "python"
+class StepOutput(BaseModel):
+    """
+    The container for a SINGLE block. 
+    The agent must use this to return one block at a time.
+    """
+    block: Union[TextBlock, TableBlock] = Field(..., description="The single content block.")
+    is_finished: bool = Field(
+        ..., description="True if the report is fully complete, False if more blocks are needed."
+    )
 
-class ImageBlock(BaseModel):
-    type: Literal["image"] = "image"
-    url: str
-    caption: str | None = None
+# --- 2. CREATE AGENT (Link 2) ---
+# We use 'create_agent' which is the standard in v1.0.
+# We uses 'response_format' with 'ToolStrategy' to force the structured output.
 
-ContentBlock = Union[TextBlock, FormulaBlock, TableBlock, CodeBlock, ChartBlock, ImageBlock]
+model = ChatOpenAI(model="gpt-4o", temperature=0)
+checkpointer = MemorySaver() # Logic for Short-Term Memory (Link 3)
 
-class StructuredResponse(BaseModel):
-    blocks: List[ContentBlock] = Field(description="List of content blocks in order")
+system_prompt = (
+    "You are a reporting assistant. "
+    "Generate the report ONE BLOCK at a time. "
+    "1. Look at the history to see what you have already generated. "
+    "2. Generate the next logical block (Introduction -> Data -> Conclusion). "
+    "3. If you have more to add, set is_finished=False. "
+    "4. If done, set is_finished=True."
+)
 
+agent = create_agent(
+    model=model,
+    tools=[], # No external tools needed, we just want the structured response
+    system_prompt=system_prompt,
+    checkpointer=checkpointer,
+    response_format=ToolStrategy(StepOutput)
+)
 
-class StructuredContentRenderer:
-    """Render structured content blocks with full Plotly support"""
+# --- 3. EXECUTION LOOP ---
+# The agent processes one step, returns the structure, and pauses. 
+# You control the "next iteration" via this loop.
+
+config = {"configurable": {"thread_id": "v1_session_1"}}
+user_input = "Report on Apple 2023 with a summary and a table."
+
+# We send the initial message
+current_request = {"messages": [("user", user_input)]}
+
+print("--- STARTING v1 AGENT LOOP ---")
+
+while True:
+    # Invoke the agent. 
+    # Because we used 'response_format', it runs until it produces 'StepOutput'.
+    result = agent.invoke(current_request, config=config)
     
-    def render(self, response: StructuredResponse):
-        for block in response.blocks:
-            self._render_block(block)
+    # Extract the Pydantic object (Structured Output)
+    response: StepOutput = result["structured_response"]
     
-    def _render_block(self, block: ContentBlock):
-        if block.type == "text":
-            self._render_text(block)
-        elif block.type == "formula":
-            self._render_formula(block)
-        elif block.type == "table":
-            self._render_table(block)
-        elif block.type == "code":
-            self._render_code(block)
-        elif block.type == "chart":
-            self._render_chart(block)
-        elif block.type == "image":
-            self._render_image(block)
+    # --- PROCESS THE BLOCK ---
+    print(f"\n📦 Generated Block: {response.block.type.upper()}")
     
-    def _render_text(self, block: TextBlock):
-        st.markdown(block.content)
-    
-    def _render_formula(self, block: FormulaBlock):
-        if block.display_mode:
-            st.latex(block.content)
-        else:
-            st.markdown(f"${block.content}$")
-    
-    def _render_table(self, block: TableBlock):
-        df = pd.DataFrame(block.rows, columns=block.headers)
-        if block.caption:
-            st.caption(block.caption)
-        st.dataframe(df, use_container_width=True)
-    
-    def _render_code(self, block: CodeBlock):
-        st.code(block.content, language=block.language)
-    
-    def _render_chart(self, block: ChartBlock):
-        """Render interactive Plotly charts"""
-        
-        if block.title:
-            st.subheader(block.title)
-        
-        # Handle raw Plotly JSON (most flexible)
-        if block.chart_type == "plotly_json":
-            fig = go.Figure(block.plotly_config)
-            st.plotly_chart(fig, use_container_width=True)
-            return
-        
-        # Convert data to DataFrame
-        df = pd.DataFrame(block.data)
-        
-        # Create Plotly figure based on chart type
-        if block.chart_type == "line":
-            fig = px.line(df, 
-                         x=df.columns[0] if len(df.columns) > 0 else None,
-                         y=df.columns[1:] if len(df.columns) > 1 else None,
-                         title=block.title,
-                         labels={'x': block.x_label, 'y': block.y_label})
-        
-        elif block.chart_type == "bar":
-            fig = px.bar(df,
-                        x=df.columns[0] if len(df.columns) > 0 else None,
-                        y=df.columns[1:] if len(df.columns) > 1 else None,
-                        title=block.title,
-                        labels={'x': block.x_label, 'y': block.y_label})
-        
-        elif block.chart_type == "scatter":
-            fig = px.scatter(df,
-                           x=df.columns[0] if len(df.columns) > 0 else None,
-                           y=df.columns[1] if len(df.columns) > 1 else None,
-                           title=block.title,
-                           labels={'x': block.x_label, 'y': block.y_label})
-            
-        elif block.chart_type == "pie":
-            fig = px.pie(df,
-                        names=df.columns[0],
-                        values=df.columns[1] if len(df.columns) > 1 else None,
-                        title=block.title)
-        
-        elif block.chart_type == "histogram":
-            fig = px.histogram(df,
-                             x=df.columns[0],
-                             title=block.title,
-                             labels={'x': block.x_label})
-        
-        elif block.chart_type == "box":
-            fig = px.box(df,
-                        y=df.columns,
-                        title=block.title)
-        
-        elif block.chart_type == "heatmap":
-            fig = px.imshow(df,
-                          title=block.title,
-                          labels=dict(color=block.y_label or "Value"))
-        
-        elif block.chart_type == "3d_scatter":
-            fig = px.scatter_3d(df,
-                              x=df.columns[0] if len(df.columns) > 0 else None,
-                              y=df.columns[1] if len(df.columns) > 1 else None,
-                              z=df.columns[2] if len(df.columns) > 2 else None,
-                              title=block.title)
-        
-        else:
-            st.error(f"Unknown chart type: {block.chart_type}")
-            return
-        
-        # Update layout if custom labels provided
-        if block.x_label or block.y_label:
-            fig.update_layout(
-                xaxis_title=block.x_label,
-                yaxis_title=block.y_label
-            )
-        
-        # Render interactive chart
-        st.plotly_chart(fig, use_container_width=True)
-    
-    def _render_image(self, block: ImageBlock):
-        st.image(block.url, caption=block.caption)
+    if response.block.type == "text":
+        print(f"Content: {response.block.content}")
+    elif response.block.type == "table":
+        print(f"Table: {response.block.headers}")
+        print(f"Rows: {len(response.block.rows)}")
+
+    # --- CHECK COMPLETION ---
+    if response.is_finished:
+        print("\n🏁 Agent signaled completion.")
+        break
+
+    # --- NEXT ITERATION ---
+    # The agent has 'Short-Term Memory' via the checkpointer. 
+    # We just trigger the next step.
+    current_request = {"messages": [("user", "Proceed to the next block.")]}
