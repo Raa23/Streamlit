@@ -1,0 +1,87 @@
+from datetime import datetime
+from typing import Any
+import psycopg
+from psycopg.rows import dict_row
+
+def _parse_av_time(s: str) -> datetime:
+    """'20260421T140723' → datetime"""
+    return datetime.strptime(s, "%Y%m%dT%H%M%S")
+
+def _to_real(v: Any) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except (ValueError, TypeError):
+        return None
+
+async def upsert_news_feed(conn: psycopg.AsyncConnection, feed: list[dict]) -> int:
+    """
+    Upsert a list of articles from AV feed.
+    Returns number of new rows inserted.
+    """
+    inserted = 0
+
+    async with conn.transaction():
+        for item in feed:
+            # --- upsert article, skip if url already exists ---
+            result = await conn.execute(
+                """
+                INSERT INTO news_articles
+                    (url, title, source, source_domain, category, summary,
+                     banner_image, authors, time_published,
+                     sentiment_score, sentiment_label, topics)
+                VALUES
+                    (%(url)s, %(title)s, %(source)s, %(source_domain)s,
+                     %(category)s, %(summary)s, %(banner_image)s,
+                     %(authors)s, %(time_published)s,
+                     %(sentiment_score)s, %(sentiment_label)s, %(topics)s)
+                ON CONFLICT (url) DO NOTHING
+                RETURNING id
+                """,
+                {
+                    "url":             item["url"],
+                    "title":           item["title"],
+                    "source":          item.get("source"),
+                    "source_domain":   item.get("source_domain"),
+                    "category":        item.get("category_within_source"),
+                    "summary":         item.get("summary"),
+                    "banner_image":    item.get("banner_image"),
+                    "authors":         item.get("authors", []),
+                    "time_published":  _parse_av_time(item["time_published"]),
+                    "sentiment_score": _to_real(item.get("overall_sentiment_score")),
+                    "sentiment_label": item.get("overall_sentiment_label"),
+                    "topics":          psycopg.types.json.Jsonb(item.get("topics", [])),
+                },
+            )
+
+            row = await result.fetchone()
+            if row is None:
+                continue  # already existed, skip tickers too
+
+            article_id = row[0]
+            inserted += 1
+
+            # --- insert ticker sentiments ---
+            ticker_rows = [
+                {
+                    "article_id":      article_id,
+                    "ticker":          t["ticker"],
+                    "relevance_score": _to_real(t.get("relevance_score")),
+                    "sentiment_score": _to_real(t.get("ticker_sentiment_score")),
+                    "sentiment_label": t.get("ticker_sentiment_label"),
+                }
+                for t in item.get("ticker_sentiment", [])
+            ]
+
+            if ticker_rows:
+                await conn.executemany(
+                    """
+                    INSERT INTO news_ticker_sentiment
+                        (article_id, ticker, relevance_score, sentiment_score, sentiment_label)
+                    VALUES
+                        (%(article_id)s, %(ticker)s, %(relevance_score)s,
+                         %(sentiment_score)s, %(sentiment_label)s)
+                    """,
+                    ticker_rows,
+                )
+
+    return inserted
