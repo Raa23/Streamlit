@@ -1,0 +1,47 @@
+import re
+
+@tool
+def search_files(pattern: str, folder: str = "*", context_lines: int = 0, max_results: int = 100) -> str:
+    """Searches files for a regex pattern (case-insensitive). Returns `path:LINE: content`.
+
+    Args:
+        pattern: Regex to search for.
+        folder: Subfolder to restrict the search to, e.g. 'agent'. Use '*' for all (default).
+        context_lines: Lines of context before/after each match (default 0).
+        max_results: Maximum number of matches to return (default 100).
+    """
+    base = ROOT if folder == "*" else (ROOT / folder).resolve()
+    if not str(base).startswith(str(ROOT)):
+        raise ValueError("Path traversal not allowed")
+    rx = re.compile(pattern, re.IGNORECASE)
+
+    out = []
+    truncated = False
+    for path in sorted(base.rglob("*")):
+        if len(out) >= max_results:
+            truncated = True
+            break
+        if not (path.is_file() and _is_allowed(path.relative_to(ROOT))):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        rel = path.relative_to(ROOT)
+        for i, line in enumerate(lines):
+            if not rx.search(line):
+                continue
+            if context_lines:
+                lo, hi = max(0, i - context_lines), min(len(lines), i + context_lines + 1)
+                out.append("\n".join(f"{rel}:{j+1}:{'>' if j==i else ' '} {lines[j]}" for j in range(lo, hi)))
+            else:
+                out.append(f"{rel}:{i+1}: {line.strip()}")
+            if len(out) >= max_results:
+                truncated = True
+                break
+
+    if not out:
+        return f"No matches for {pattern!r}."
+    sep = "\n--\n" if context_lines else "\n"
+    footer = f"\n\n[truncated at {max_results} results]" if truncated else ""
+    return f"{len(out)} match(es) for {pattern!r}:\n{sep.join(out)}{footer}"
