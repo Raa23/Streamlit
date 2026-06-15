@@ -1,0 +1,71 @@
+from datetime import datetime
+from typing import Optional
+
+
+async def get_news(
+    cur,
+    *,
+    n: int = 20,
+    before: Optional[datetime] = None,      # T: only news at or before this date
+    ticker: Optional[str] = None,           # exact match on ticker
+    crds: Optional[str] = None,             # exact match on mdsCode/crds
+    topic: Optional[str] = None,            # fuzzy, e.g. "china"
+    min_sentiment: Optional[float] = None,
+    max_sentiment: Optional[float] = None,
+):
+    """Retrieve the n most recent news items up to `before`, with optional filters."""
+    conditions = []
+    params: list = []
+
+    if before is not None:
+        conditions.append("a.time_published <= %s")
+        params.append(before)
+
+    if ticker is not None:
+        conditions.append("ts.ticker = %s")
+        params.append(ticker)
+
+    if crds is not None:
+        conditions.append("ts.mdsCode = %s")
+        params.append(crds)
+
+    if topic is not None:
+        # fuzzy: case-insensitive substring on topic name
+        conditions.append("tp.topic ILIKE %s")
+        params.append(f"%{topic}%")
+
+    if min_sentiment is not None:
+        conditions.append("ts.sentiment_score >= %s")
+        params.append(min_sentiment)
+
+    if max_sentiment is not None:
+        conditions.append("ts.sentiment_score <= %s")
+        params.append(max_sentiment)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    # join only the tables the filters need, but keep it simple: left joins
+    # so an article without a ticker/topic row still appears unless filtered
+    query = f"""
+        SELECT DISTINCT
+            a.id,
+            a.title,
+            a.url,
+            a.time_published,
+            a.summary,
+            ts.ticker,
+            ts.mdsCode,
+            ts.relevance_score,
+            ts.sentiment_score,
+            ts.sentiment_label
+        FROM news_articles AS a
+        LEFT JOIN news_ticker_sentiment AS ts ON ts.article_id = a.id
+        LEFT JOIN news_topics          AS tp ON tp.article_id = a.id
+        {where}
+        ORDER BY a.time_published DESC
+        LIMIT %s
+    """
+    params.append(n)
+
+    await cur.execute(query, params)
+    return await cur.fetchall()
