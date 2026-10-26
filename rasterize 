@@ -1,0 +1,170 @@
+"""Rasterize EMF/WMF images inside OOXML packages (.pptx, .docx, .xlsx) to PNG.
+
+Works at the zip/OPC level, so it is format-agnostic and needs no python-pptx
+or python-docx: media parts are re-encoded as PNG, every .rels Target pointing
+at them is rewritten, and [Content_Types].xml is updated.
+
+Rendering: Pillow + Windows GDI on Windows; LibreOffice (soffice) elsewhere.
+"""
+from __future__ import annotations
+
+import gzip
+import io
+import os
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import warnings
+import zipfile
+
+from PIL import Image, ImageChops
+
+_VECTOR_EXTS = {".emf", ".wmf", ".emz", ".wmz"}  # .emz/.wmz = gzipped EMF/WMF
+_TARGET_RE = re.compile(r'(\bTarget=)(["\'])(.*?)\2')
+
+
+def rasterize_vector_images(data: bytes, dpi: int = 200) -> bytes:
+    """Return the OOXML package bytes with every EMF/WMF image replaced by a PNG.
+
+    Returns the input unchanged if there is nothing to convert. Images that
+    fail to render are left as-is (with a RuntimeWarning).
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as zin:
+        names = zin.namelist()
+        vector = [n for n in names if posixpath.splitext(n)[1].lower() in _VECTOR_EXTS]
+        if not vector:
+            return data
+
+        taken = {n.lower() for n in names}
+        renamed: dict[str, str] = {}  # old part name (lowercased) -> new part name
+        pngs: dict[str, bytes] = {}   # old part name (original case) -> png bytes
+        for old in vector:
+            try:
+                png = _render_png(zin.read(old), dpi)
+            except Exception as exc:
+                warnings.warn(f"Could not rasterize {old}: {exc}", RuntimeWarning)
+                continue
+            new = posixpath.splitext(old)[0] + ".png"
+            while new.lower() in taken:
+                new = new[:-4] + "_r.png"
+            taken.add(new.lower())
+            renamed[old.lower()] = new
+            pngs[old] = png
+        if not renamed:
+            return data
+
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                name = info.filename
+                if name in pngs:
+                    zout.writestr(renamed[name.lower()], pngs[name])
+                    continue
+                content = zin.read(name)
+                if name.lower().endswith(".rels"):
+                    content = _fix_rels(name, content, renamed)
+                elif name == "[Content_Types].xml":
+                    content = _fix_content_types(content, renamed)
+                zout.writestr(info, content)
+    return out.getvalue()
+
+
+def _fix_rels(rels_name: str, content: bytes, renamed: dict[str, str]) -> bytes:
+    # ppt/slides/_rels/slide1.xml.rels -> targets are relative to ppt/slides/
+    base = posixpath.dirname(posixpath.dirname(rels_name))
+
+    def repl(m: re.Match) -> str:
+        target = m.group(3)
+        if target.startswith("/"):
+            resolved = target.lstrip("/")
+        else:
+            resolved = posixpath.normpath(posixpath.join(base, target))
+        new = renamed.get(resolved.lower())
+        if new is None:
+            return m.group(0)
+        new_target = posixpath.join(posixpath.dirname(target), posixpath.basename(new))
+        return f"{m.group(1)}{m.group(2)}{new_target}{m.group(2)}"
+
+    return _TARGET_RE.sub(repl, content.decode("utf-8")).encode("utf-8")
+
+
+def _fix_content_types(content: bytes, renamed: dict[str, str]) -> bytes:
+    text = content.decode("utf-8")
+    for old in renamed:  # drop per-part overrides for the replaced EMF/WMF parts
+        text = re.sub(
+            rf'<Override\b[^>]*\bPartName=["\']/{re.escape(old)}["\'][^>]*/>',
+            "", text, flags=re.IGNORECASE,
+        )
+    if not re.search(r'<Default\b[^>]*\bExtension=["\']png["\']', text, re.IGNORECASE):
+        text = text.replace("</Types>", '<Default Extension="png" ContentType="image/png"/></Types>')
+    return text.encode("utf-8")
+
+
+def _render_png(blob: bytes, dpi: int) -> bytes:
+    if blob[:2] == b"\x1f\x8b":  # .emz / .wmz
+        blob = gzip.decompress(blob)
+    ext = "emf" if blob[40:44] == b" EMF" else "wmf"
+
+    if sys.platform == "win32":
+        img = Image.open(io.BytesIO(blob))
+        img.load(dpi=dpi)  # Pillow renders EMF/WMF via GDI on Windows only
+        img = _flatten(img)
+    else:
+        img = _trim_whitespace(_flatten(_render_with_libreoffice(blob, ext, dpi)))
+
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue()
+
+
+def _render_with_libreoffice(blob: bytes, ext: str, dpi: int) -> Image.Image:
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise RuntimeError("LibreOffice (soffice) not found; needed for EMF/WMF on non-Windows")
+    # LibreOffice Draw drops the picture on a default A4 page and exports the whole
+    # page (96 dpi by default). Export the page at the requested dpi, then trim.
+    w, h = round(8.27 * dpi), round(11.69 * dpi)
+    png_filter = (
+        'png:draw_png_Export:{'
+        f'"PixelWidth":{{"type":"long","value":"{w}"}},'
+        f'"PixelHeight":{{"type":"long","value":"{h}"}}}}'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, f"img.{ext}")
+        with open(src, "wb") as f:
+            f.write(blob)
+        subprocess.run(
+            [
+                soffice,
+                f"-env:UserInstallation=file://{tmp}/lo_profile",  # isolates concurrent runs
+                "--headless", "--convert-to", png_filter, "--outdir", tmp, src,
+            ],
+            check=True, capture_output=True, timeout=120,
+        )
+        img = Image.open(os.path.join(tmp, "img.png"))
+        img.load()
+        return img
+
+
+def _flatten(img: Image.Image) -> Image.Image:
+    """Flatten transparency onto white so OCR sees dark text on a light background."""
+    if img.mode in ("RGBA", "LA", "P"):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, "white")
+        bg.paste(rgba, mask=rgba.getchannel("A"))
+        return bg
+    return img.convert("RGB")
+
+
+def _trim_whitespace(img: Image.Image, margin: int = 10) -> Image.Image:
+    """Crop the blank page area LibreOffice puts around the picture."""
+    diff = ImageChops.difference(img, Image.new("RGB", img.size, "white"))
+    bbox = diff.convert("L").point(lambda p: 255 if p > 8 else 0).getbbox()
+    if not bbox:
+        return img
+    l, t, r, b = bbox
+    return img.crop((max(l - margin, 0), max(t - margin, 0),
+                     min(r + margin, img.width), min(b + margin, img.height)))
